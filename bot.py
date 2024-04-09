@@ -5,6 +5,7 @@ from aiogram.dispatcher import FSMContext
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher.filters.state import StatesGroup, State
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.utils.exceptions import InvalidHTTPUrlContent, BadRequest
 from aiogram.dispatcher.filters import Text
 import aiogram
 import config
@@ -28,10 +29,10 @@ async def on_startup(_):
 
 # Получение числа из базы данных
 def get_number_of_messages(message):
-    cursor.execute(f"SELECT * FROM number_of_messages WHERE id ={message.chat.id}")
+    cursor.execute(f"SELECT * FROM number_of_messages WHERE id_group ={message.chat.id}")
     result = cursor.fetchone()
     if result is not None:
-        return result[2]
+        return result[3]
     else:
         # Обработка случая, когда запрос не вернул результатов
         return None
@@ -39,9 +40,6 @@ def get_number_of_messages(message):
 #------------ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ-------------
 # Словарь для хранения количества отправленных сообщений в каждом чате
 messages_history = {}
-
-# Словарь для хранения идентификаторов предыдущих сообщений с фотографией
-prev_photo_messages = {}
 
 # Переменные для хранения информации о кнопках
 id_bn = None  # Идентификатор кнопки
@@ -102,6 +100,28 @@ class VisionState(StatesGroup):
 #----------------------------------------------
 
 
+async def InputNameGroup(message):
+    # Получаем список уникальных названий чатов из базы данных
+    cursor.execute(f"SELECT DISTINCT title FROM main")
+    unique_rows = cursor.fetchall()
+    
+    if unique_rows:  # Проверяем, не пуст ли список уникальных названий чатов
+        # Создаем клавиатуру для выбора чата и добавляем кнопки с уникальными названиями чатов
+        kb = ReplyKeyboardMarkup()
+        for row in unique_rows:
+            kb.add(KeyboardButton(f'{row[0]}'))
+        
+        # Отправляем сообщение с просьбой выбрать чат и клавиатурой
+        await bot.send_message(chat_id=message.from_user.id,
+                               text="Выберите чат:",
+                               reply_markup=kb)
+        return True
+    else:
+        await bot.send_message(chat_id=message.from_user.id,
+                               text="Группы не найдены.")
+        return False
+
+
 # Обработчик команды отмены в любом состоянии
 @dp.message_handler(commands='cancel', state='*')
 async def cmd_cancel(message: types.Message):
@@ -119,46 +139,54 @@ async def cmd_cancel(message: types.Message):
     await MainState.admin_setting.set()
 
 
-# Функция для отправки сообщения оповещения и удаления предыдущего
-async def send_notification(chat_id, message_id, message):
+async def send_notification(chat_id, message):
     """
     Отправляет сообщение оповещения и удаляет предыдущее, если оно было.
     
     :param chat_id: ID чата, куда отправляется сообщение
-    :param message_id: ID предыдущего сообщения, которое нужно удалить
     :param message: Текст сообщения, которое нужно отправить
     """
-    try:
-        # Удаляем предыдущее сообщение, если оно существует
-        if message_id:
-            await bot.delete_message(chat_id, message_id)
-        
-        # Удаляем предыдущее фото-сообщение, если оно существует в словаре prev_photo_messages
-        if chat_id in prev_photo_messages:
-            await bot.delete_message(chat_id, prev_photo_messages[chat_id])
-        
-        # Получаем данные для создания клавиатуры из базы данных
-        cursor.execute(f"SELECT * FROM main_keyboard WHERE id ={message.chat.id}")
-        rows = cursor.fetchall()
-        ikb = InlineKeyboardMarkup(resize_keyboard=True)
-        for row in rows:
-            ikb.add(InlineKeyboardButton(text=row[2], url=row[3]))
+    sent_message = None
+    # Получаем данные для создания клавиатуры из базы данных
+    cursor.execute(f"SELECT * FROM keyboard WHERE id_group ={chat_id}")
+    rows = cursor.fetchall()
+    ikb = InlineKeyboardMarkup(resize_keyboard=True)
+    for row in rows:
+        ikb.add(InlineKeyboardButton(text=row[3], url=row[4]))
 
-        # Получаем данные о главном сообщении из базы данных
-        cursor.execute(f"SELECT * FROM main WHERE id ={message.chat.id}")
-        row = cursor.fetchone()
-        
-        # Отправляем сообщение или фото в зависимости от настроек в базе данных
-        if row:
-            if row[3] == 1:  # Если необходимо отправить фото
-                sent_message = await bot.send_photo(chat_id, row[2], reply_markup=ikb)
-            else:  # Если необходимо отправить текстовое сообщение
-                sent_message = await bot.send_message(chat_id, row[4], reply_markup=ikb)
-            
-            # Записываем ID нового сообщения в словарь prev_photo_messages
-            prev_photo_messages[chat_id] = sent_message.message_id
-    except exceptions.MessageToDeleteNotFound:
-        pass  # Игнорируем ошибку, если сообщение для удаления не найдено
+    # Получаем данные о главном сообщении из базы данных
+    cursor.execute(f"SELECT * FROM main WHERE id_group ={chat_id}")
+    row = cursor.fetchone()
+    
+    # Отправляем сообщение
+    if row:
+        if row[4] == 1:  # Если необходимо отправить фото
+            sent_message = await bot.send_photo(chat_id, row[3], reply_markup=ikb)
+        else:  # Если необходимо отправить текстовое сообщение
+            sent_message = await bot.send_message(chat_id, row[5], reply_markup=ikb)
+
+    # Сохраняем информацию о предыдущем сообщении в базу данных
+    if sent_message:
+        cursor.execute("INSERT INTO temp (id_group, title, message) VALUES (?, ?, ?)", (chat_id, row[2], sent_message.message_id))
+        con.commit()
+
+
+
+async def delete_previous_message(chat_id):
+    # Получаем информацию о предыдущем сообщении из базы данных
+    cursor.execute(f"SELECT * FROM temp WHERE id_group ={chat_id}")
+    row = cursor.fetchone()
+    if row:
+        # Удаляем предыдущее сообщение, если идентификатор доступен
+        if row[3]:
+            await bot.delete_message(chat_id, row[3])
+
+            # Удаляем запись о предыдущем сообщении из базы данных
+            cursor.execute("DELETE FROM temp WHERE id_group = ?", (chat_id,))
+            con.commit()
+
+
+
 
 
 async def check_public(message: types.Message):
@@ -168,33 +196,33 @@ async def check_public(message: types.Message):
     :param message: Сообщение, содержащее информацию о чате
     """
     # Проверяем наличие информации о количестве сообщений в базе данных
-    cursor.execute(f"SELECT * FROM number_of_messages WHERE id ={message.chat.id}")
+    cursor.execute(f"SELECT * FROM number_of_messages WHERE id_group ={message.chat.id}")
     rows = cursor.fetchall()
     
     if rows == []:
         # Если информация отсутствует, добавляем новую запись
         if str(message.chat.id).startswith('-'):  # Проверяем, является ли ID чата групповым
-            cursor.execute("INSERT INTO number_of_messages (id, title, number) VALUES (?, ?, ?)", (message.chat.id, message.chat.title, config.NUMBER_MESSAGE))
+            cursor.execute("INSERT INTO number_of_messages (id_group, title, number) VALUES (?, ?, ?)", (message.chat.id, message.chat.title, config.NUMBER_MESSAGE))
             con.commit()
     
     # Проверяем наличие информации о главном сообщении в базе данных
-    cursor.execute(f"SELECT * FROM main WHERE id ={message.chat.id}")
+    cursor.execute(f"SELECT * FROM main WHERE id_group ={message.chat.id}")
     rows = cursor.fetchall()
     
     if rows == []:
         if str(message.chat.id).startswith('-'):  # Проверяем, является ли ID чата групповым
         # Если информация отсутствует, добавляем новую запись
-            cursor.execute("INSERT INTO main (id, title, url, status, text) VALUES (?, ?, ?, ?, ?)", (message.chat.id, message.chat.title, config.PHOTO_URL, 1, config.TEXT))
+            cursor.execute("INSERT INTO main (id_group, title, url, status, text) VALUES (?, ?, ?, ?, ?)", (message.chat.id, message.chat.title, config.PHOTO_URL, 1, config.TEXT))
             con.commit()
 
     # Проверяем наличие информации о клавиатуре в базе данных
-    cursor.execute(f"SELECT * FROM main_keyboard WHERE id ={message.chat.id}")
+    cursor.execute(f"SELECT * FROM keyboard WHERE id_group ={message.chat.id}")
     rows = cursor.fetchall()
     
     if rows == []:
         if str(message.chat.id).startswith('-'):  # Проверяем, является ли ID чата групповым
             # Если информация отсутствует, добавляем новую запись
-            cursor.execute("INSERT INTO main_keyboard (id, title, name, url) VALUES (?, ?, ?, ?)", (message.chat.id, message.chat.title, config.BUTTON_NAME, config.BUTTON_URL))
+            cursor.execute("INSERT INTO keyboard (id_group, title, name, url) VALUES (?, ?, ?, ?)", (message.chat.id, message.chat.title, config.BUTTON_NAME, config.BUTTON_URL))
             con.commit()
 
 
@@ -239,7 +267,7 @@ async def admin_password(message: types.Message):
 async def cmd_delete_public(message: types.Message):
     public_name = message.get_args()  # Получаем название паблика из аргументов команды
     if public_name:
-        cursor.execute("DELETE FROM main_keyboard WHERE title = ?", (public_name,))
+        cursor.execute("DELETE FROM keyboard WHERE title = ?", (public_name,))
         cursor.execute("DELETE FROM main WHERE title = ?", (public_name,))
         cursor.execute("DELETE FROM number_of_messages WHERE title = ?", (public_name,))
         con.commit()  # Фиксируем изменения в базе данных
@@ -302,11 +330,6 @@ async def delete_message_command(message: types.Message):
                                text="Пожалуйста, укажите ссылку на сообщение после команды '/delete_message'.")
 
 
-# print(chat_id, message_id)
-
-
-
-
 @dp.message_handler(Text(equals='Предпросмотр'), state=MainState.admin_setting)
 async def settings_vision(message: types.Message):
     """
@@ -314,25 +337,10 @@ async def settings_vision(message: types.Message):
     
     :param message: Сообщение с запросом на изменение варианта рекламы
     """
-    # Получаем список уникальных названий чатов из базы данных
-    cursor.execute("SELECT DISTINCT title FROM main")
-    unique_rows = cursor.fetchall()
-    
-    if unique_rows:  # Проверяем, не пуст ли список уникальных названий чатов
-        # Создаем клавиатуру для выбора чата и добавляем кнопки с уникальными названиями чатов
-        kb = ReplyKeyboardMarkup()
-        for row in unique_rows:
-            kb.add(KeyboardButton(f'{row[0]}'))
-        
-        # Отправляем сообщение с просьбой выбрать чат и клавиатурой
-        await bot.send_message(chat_id=message.from_user.id,
-                               text="Выберите чат:",
-                               reply_markup=kb)
-        # Устанавливаем состояние 'targetChat' для ожидания выбора чата
+    check = await InputNameGroup(message)
+    if check:
         await VisionState.vision.set()
-    else:
-        await bot.send_message(chat_id=message.from_user.id,
-                               text="Группы не найдены.")
+    
         
 # Обработчик для изменения статуса варианта рекламы выбранного чата
 @dp.message_handler(state=VisionState.vision)
@@ -340,30 +348,35 @@ async def settings_vision_confirm(message: types.Message):
     cursor.execute(f"SELECT * FROM main WHERE title = '{message.text}'")
     row = cursor.fetchall()
     for rows in row:
-        chat_id = rows[0]
+        chat_id = rows[1]
     # Получаем данные для создания клавиатуры из базы данных
-    cursor.execute(f"SELECT * FROM main_keyboard WHERE id ={chat_id}")
+    cursor.execute(f"SELECT * FROM keyboard WHERE id_group ={chat_id}")
     rows = cursor.fetchall()
     ikb = InlineKeyboardMarkup(resize_keyboard=True)
     for row in rows:
-        ikb.add(InlineKeyboardButton(text=row[2], url=row[3]))
+        ikb.add(InlineKeyboardButton(text=row[3], url=row[4]))
     # print(chat_id, )
     # Получаем данные о главном сообщении из базы данных
-    cursor.execute(f"SELECT * FROM main WHERE id ={chat_id}")
+    cursor.execute(f"SELECT * FROM main WHERE id_group ={chat_id}")
     row = cursor.fetchone()
     await bot.send_message(chat_id=message.from_user.id,
                                    text=f'Предпросмотр рекламы для группы {message.text}',
                                    reply_markup=kb)
     # Отправляем сообщение или фото в зависимости от настроек в базе данных
     if row:
-        if row[3] == 1:  # Если необходимо отправить фото
+        if row[4] == 1:  # Если необходимо отправить фото
             await bot.send_photo(chat_id=message.from_user.id,
-                                photo=row[2], 
+                                photo=row[3], 
                                 reply_markup=ikb)
         else:  # Если необходимо отправить текстовое сообщение
             await bot.send_message(chat_id=message.from_user.id,
-                                   text=row[4],
+                                   text=row[5],
                                    reply_markup=ikb)
+    cursor.execute(f"SELECT * FROM number_of_messages WHERE id_group ={chat_id}")
+    row = cursor.fetchone()
+    if row:
+        await bot.send_message(chat_id=message.from_user.id,
+                                   text=f"Интервал сообщений: {row[3]}")
     await bot.send_message(chat_id=message.from_user.id,
                                    text='Вы вернулись в панель администратора.',
                                    reply_markup=kb)
@@ -379,25 +392,10 @@ async def settings_status(message: types.Message):
     
     :param message: Сообщение с запросом на изменение варианта рекламы
     """
-    # Получаем список уникальных названий чатов из базы данных
-    cursor.execute("SELECT DISTINCT title FROM main")
-    unique_rows = cursor.fetchall()
-    
-    if unique_rows:  # Проверяем, не пуст ли список уникальных названий чатов
-        # Создаем клавиатуру для выбора чата и добавляем кнопки с уникальными названиями чатов
-        kb = ReplyKeyboardMarkup()
-        for row in unique_rows:
-            kb.add(KeyboardButton(f'{row[0]}'))
-        
-        # Отправляем сообщение с просьбой выбрать чат и клавиатурой
-        await bot.send_message(chat_id=message.from_user.id,
-                               text="Выберите чат:",
-                               reply_markup=kb)
-        # Устанавливаем состояние 'targetChat' для ожидания выбора чата
+    check = await InputNameGroup(message)
+    if check:
         await AdVariantState.targetChat.set()
-    else:
-        await bot.send_message(chat_id=message.from_user.id,
-                               text="Группы не найдены.")
+    
 
 
 # Обработчик для изменения статуса варианта рекламы выбранного чата
@@ -412,13 +410,13 @@ async def settings_status_confirm(message: types.Message):
     cursor.execute(f"SELECT * FROM main WHERE title = '{message.text}'")  # Извлекаем информацию о выбранном чате из базы данных
     row = cursor.fetchall()
     for rows in row:
-        if rows[3] == 1:  # Если текущий статус рекламы - активен
+        if rows[4] == 1:  # Если текущий статус рекламы - активен
             cursor.execute(f"UPDATE main SET status = ? WHERE title = ?", (2, message.text))  # Меняем статус на неактивен
             # Отправляем сообщение о успешном изменении варианта рекламы
             await bot.send_message(chat_id=message.from_user.id,
                                 text="Вариант изменён на текст.",
                                 reply_markup=kb)
-        elif rows[3] == 2:  # Если текущий статус рекламы - неактивен
+        elif rows[4] == 2:  # Если текущий статус рекламы - неактивен
             cursor.execute(f"UPDATE main SET status = ? WHERE title = ?", (1, message.text))  # Меняем статус на активен
             # Отправляем сообщение о успешном изменении варианта рекламы
             await bot.send_message(chat_id=message.from_user.id,
@@ -438,26 +436,10 @@ async def settings_bn(message: types.Message):
     
     :param message: Сообщение с запросом на изменение кнопок в клавиатуре
     """
-    # Получаем список уникальных названий чатов из базы данных, содержащих кнопки
-    cursor.execute("SELECT DISTINCT title FROM main")
-    unique_rows = cursor.fetchall()
-    
-    if unique_rows:  # Проверяем, не пуст ли список уникальных названий чатов
-        # Создаем клавиатуру для выбора чата и добавляем кнопки с уникальными названиями чатов
-        kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-        for row in unique_rows:
-            kb.add(KeyboardButton(f'{row[0]}'))
-        
-        # Отправляем сообщение с просьбой выбрать чат и клавиатурой
-        await bot.send_message(chat_id=message.from_user.id,
-                               text="Выберите чат:",
-                               reply_markup=kb)
-        
-        # Устанавливаем состояние 'targetChat' для ожидания выбора чата
+    check = await InputNameGroup(message)
+    if check:
         await KeyboardSettingsState.targetChat.set()
-    else:
-        await bot.send_message(chat_id=message.from_user.id,
-                               text="Нет доступных чатов для изменения кнопок.")
+    
 
 
 
@@ -470,18 +452,20 @@ async def settings_bn_public(message: types.Message):
     :param message: Сообщение с выбранным чатом
     """
     global name_public  # Глобальная переменная с названием чата
-    cursor.execute(f"SELECT * FROM main_keyboard")  # Получаем информацию о кнопках из базы данных
+    global id_bn
+    cursor.execute(f"SELECT * FROM keyboard")  # Получаем информацию о кнопках из базы данных
     row = cursor.fetchall()
     name_public = message.text  # Получаем название выбранного чата
     # Отправляем сообщение с названием выбранного чата
     await bot.send_message(chat_id=message.from_user.id,
                            text=f"Для группы {name_public} бот имеет следующие кнопки:")
     for rows in row:
-        if message.text == rows[1]:  # Если название чата соответствует выбранному
-            name_public = rows[1]
+        if message.text == rows[2]:  # Если название чата соответствует выбранному
+            id_bn = rows[1]
+            name_public = rows[2]
             # Отправляем информацию о кнопках в выбранном чате
             await bot.send_message(chat_id=message.from_user.id,
-                                   text=f"Название кнопки: {rows[2]}\nСодержание: {rows[3]}")
+                                   text=f"Название кнопки: {rows[3]}\nСодержание: {rows[4]}")
     # Создаем клавиатуру с опциями для управления кнопками
     kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     kb.add(KeyboardButton("Добавить кнопку"))
@@ -504,17 +488,17 @@ async def settings_bn_choice(message: types.Message):
     :param message: Сообщение с запросом на изменение кнопки
     """
     global name_public  # Глобальная переменная с названием чата
-    cursor.execute(f"SELECT * FROM main_keyboard WHERE title = '{name_public}'")  # Получаем информацию о кнопках выбранного чата из базы данных
+    cursor.execute(f"SELECT * FROM keyboard WHERE title = '{name_public}'")  # Получаем информацию о кнопках выбранного чата из базы данных
     row = cursor.fetchall()
     
     kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)  # Создаем клавиатуру для выбора кнопок
     i = 1
     for rows in row:
         if i == 1:
-            kb.add(KeyboardButton(f'Кнопка: {rows[2]}'))  # Добавляем кнопки в клавиатуру
+            kb.add(KeyboardButton(f'Кнопка: {rows[3]}'))  # Добавляем кнопки в клавиатуру
             i += 1
         elif i == 2:
-            kb.insert(KeyboardButton(f'Кнопка: {rows[2]}'))  # Добавляем кнопки в клавиатуру
+            kb.insert(KeyboardButton(f'Кнопка: {rows[3]}'))  # Добавляем кнопки в клавиатуру
             i = 1
     
     # Отправляем сообщение с просьбой выбрать кнопку и клавиатурой
@@ -543,12 +527,12 @@ async def settings_bn_enter_option(message: types.Message):
 
     
     # Получаем информацию о выбранной кнопке из базы данных
-    cursor.execute(f"SELECT * FROM main_keyboard WHERE title = '{name_public}' AND name = '{name}'")
+    cursor.execute(f"SELECT * FROM keyboard WHERE title = '{name_public}' AND name = '{name}'")
     row = cursor.fetchall()
     
     for rows in row:
-        id_bn = rows[0]  # Сохраняем идентификатор выбранной кнопки
-        old_name = rows[2]  # Сохраняем текущее название кнопки
+        id_bn = rows[1]  # Сохраняем идентификатор выбранной кнопки
+        old_name = rows[3]  # Сохраняем текущее название кнопки
     
     # Создаем клавиатуру с опциями для изменения параметров кнопки
     kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
@@ -602,9 +586,6 @@ async def settings_bn_option_url(message: types.Message):
     await KeyboardSettingsState.ButtonSave.set()
 
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from aiogram.utils.exceptions import InvalidHTTPUrlContent, BadRequest
-
 @dp.message_handler(state=KeyboardSettingsState.ButtonSave)
 async def settings_bn_save(message: types.Message):
     """
@@ -619,7 +600,15 @@ async def settings_bn_save(message: types.Message):
     # Проверяем, какой параметр был изменен
     if parametr == 'name':  # Если изменялось имя кнопки
         # Обновляем информацию о имени кнопки в базе данных
-        cursor.execute(f"UPDATE main_keyboard SET name = ? WHERE id = ? AND name = ?", (message.text, id_bn, old_name))
+        cursor.execute(f"SELECT name FROM keyboard WHERE id_group = {id_bn}")
+        result = cursor.fetchall()
+        for row in result:
+            if row[0] == message.text:
+                await bot.send_message(chat_id=message.from_user.id,
+                           text="Кнопка с таким именем уже существует.")
+                await settings_bn_option_name(message)
+                return
+        cursor.execute(f"UPDATE keyboard SET name = ? WHERE id_group = ? AND name = ?", (message.text, id_bn, old_name))
     elif parametr == 'url':  # Если изменялась ссылка кнопки
         # Создаем инлайн-кнопку для проверки ссылки
         if message.text.startswith("@"):
@@ -640,7 +629,7 @@ async def settings_bn_save(message: types.Message):
             return
     
         # Если ссылка прошла проверку, обновляем информацию о ссылке кнопки в базе данных
-        cursor.execute(f"UPDATE main_keyboard SET url = ? WHERE id = ? AND name = ?", (url, id_bn, old_name))
+        cursor.execute(f"UPDATE keyboard SET url = ? WHERE id_group = ? AND name = ?", (url, id_bn, old_name))
     
     con.commit()  # Фиксируем изменения в базе данных
     
@@ -665,16 +654,16 @@ async def settings_bn_option_del(message: types.Message):
     :param message: Сообщение с запросом на удаление кнопки
     """
     global name_public  # Глобальная переменная с названием чата
-    cursor.execute(f"SELECT * FROM main_keyboard WHERE title = '{name_public}'")  # Получаем информацию о кнопках выбранного чата из базы данных
+    cursor.execute(f"SELECT * FROM keyboard WHERE title = '{name_public}'")  # Получаем информацию о кнопках выбранного чата из базы данных
     row = cursor.fetchall()
     kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)  # Создаем клавиатуру для выбора кнопок
     i = 1
     for rows in row:
         if i == 1:
-            kb.add(KeyboardButton(f'Кнопка: {rows[2]}'))  # Добавляем кнопки в клавиатуру
+            kb.add(KeyboardButton(f'Кнопка: {rows[3]}'))  # Добавляем кнопки в клавиатуру
             i += 1
         elif i == 2:
-            kb.insert(KeyboardButton(f'Кнопка: {rows[2]}'))  # Добавляем кнопки в клавиатуру
+            kb.insert(KeyboardButton(f'Кнопка: {rows[3]}'))  # Добавляем кнопки в клавиатуру
             i = 1
     
     # Отправляем сообщение с просьбой выбрать кнопку и клавиатурой
@@ -700,7 +689,7 @@ async def settings_bn_del_confirm(message: types.Message):
     name = message.text.split(':')[1].strip()
     
     # Проверяем, сколько кнопок осталось у данного чата
-    cursor.execute("SELECT COUNT(*) FROM main_keyboard WHERE title = ?", (name_public,))
+    cursor.execute("SELECT COUNT(*) FROM keyboard WHERE title = ?", (name_public,))
     num_buttons = cursor.fetchone()[0]
     
     if num_buttons == 1:
@@ -713,7 +702,7 @@ async def settings_bn_del_confirm(message: types.Message):
         return
     
     # Удаляем информацию о выбранной кнопке из базы данных
-    cursor.execute(f"DELETE FROM main_keyboard WHERE title = ? AND name = ?", (name_public, name))
+    cursor.execute(f"DELETE FROM keyboard WHERE title = ? AND name = ?", (name_public, name))
     con.commit()  # Фиксируем изменения в базе данных
     
     # Отправляем сообщение об успешном удалении кнопки
@@ -752,6 +741,15 @@ async def settings_bn_new_link(message: types.Message):
     
     :param message: Сообщение с введенным именем новой кнопки
     """
+    global id_bn
+    cursor.execute(f"SELECT name FROM keyboard WHERE id_group = {id_bn}")
+    result = cursor.fetchall()
+    for row in result:
+        if row[0] == message.text:
+            await bot.send_message(chat_id=message.from_user.id,
+                        text="Кнопка с таким именем уже существует.")
+            await settings_bn_new_name(message)
+            return
     global name  # Глобальная переменная для хранения имени новой кнопки
     name = message.text  # Сохраняем введенное имя новой кнопки
     
@@ -762,9 +760,6 @@ async def settings_bn_new_link(message: types.Message):
     # Устанавливаем состояние 'NewButtonLink' для ожидания ввода ссылки для новой кнопки
     await KeyboardSettingsState.NewButtonLink.set()
 
-
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from aiogram.utils.exceptions import InvalidHTTPUrlContent, BadRequest
 
 @dp.message_handler(state=KeyboardSettingsState.NewButtonLink)
 async def settings_bn_add(message: types.Message):
@@ -780,11 +775,11 @@ async def settings_bn_add(message: types.Message):
     url = message.text  # Сохраняем введенную ссылку для новой кнопки
     
     # Получаем информацию о кнопках выбранного чата из базы данных
-    cursor.execute(f"SELECT * FROM main_keyboard WHERE title = '{name_public}'")
+    cursor.execute(f"SELECT * FROM keyboard WHERE title = '{name_public}'")
     row = cursor.fetchall()
     
     for rows in row:
-        id = rows[0]  # Получаем идентификатор чата для добавления новой кнопки
+        id = rows[1]  # Получаем идентификатор чата для добавления новой кнопки
     
     if url.startswith("@"):
         # https://t.me/@reklama_horizont
@@ -805,7 +800,7 @@ async def settings_bn_add(message: types.Message):
         return
     
     # Если ссылка прошла проверку, добавляем информацию о новой кнопке в базу данных
-    cursor.execute("INSERT INTO main_keyboard (id, title, name, url) VALUES (?, ?, ?, ?)", (id, name_public, name, url))
+    cursor.execute("INSERT INTO keyboard (id_group, title, name, url) VALUES (?, ?, ?, ?)", (id, name_public, name, url))
     con.commit()  # Фиксируем изменения в базе данных
     
     # Отправляем сообщение об успешном добавлении новой кнопки
@@ -825,26 +820,10 @@ async def settings_data(message: types.Message):
     
     :param message: Сообщение с запросом на изменение фотографии или текста
     """
-    # Асинхронно получаем список чатов из базы данных
-    cursor.execute("SELECT * FROM main")
-    rows = cursor.fetchall()
-    
-    if rows:  # Проверяем, не пуст ли список чатов
-        # Создаем клавиатуру для выбора чата
-        kb = ReplyKeyboardMarkup()
-        for row in rows:
-            kb.add(KeyboardButton(row[1]))
-        
-        # Отправляем сообщение с просьбой выбрать чат и клавиатурой
-        await bot.send_message(chat_id=message.from_user.id,
-                               text="Выберите чат:",
-                               reply_markup=kb)
-        
-        # Устанавливаем состояние 'targetChat' для ожидания выбора чата для изменения фотографии или текста
+    check = await InputNameGroup(message)
+    if check:
         await AdContentModificationState.targetChat.set()
-    else:
-        await bot.send_message(chat_id=message.from_user.id,
-                               text="Нет доступных чатов для изменения фотографии или текста.")
+    
 
 
 
@@ -863,23 +842,23 @@ async def settings_option_types(message: types.Message):
     row = cursor.fetchall()
     
     for rows in row:
-        if message.text == rows[1]:  # Если выбранное название чата соответствует одному из чатов в базе данных
-            name_public = rows[1]  # Сохраняем название выбранного чата
+        if message.text == rows[2]:  # Если выбранное название чата соответствует одному из чатов в базе данных
+            name_public = rows[2]  # Сохраняем название выбранного чата
             
-            if rows[3] == 1:  # Если тип чата - фотография
+            if rows[4] == 1:  # Если тип чата - фотография
                 # Отправляем сообщение с текущей фотографией и просьбой ввести новую ссылку для фотографии
                 await bot.send_message(chat_id=message.from_user.id,
-                                       text=f"Текущее фото для группы {rows[1]}")
+                                       text=f"Текущее фото для группы {rows[2]}")
                 await bot.send_photo(chat_id=message.from_user.id, 
-                                     photo=rows[2])
+                                     photo=rows[3])
                 await bot.send_message(chat_id=message.from_user.id,
                                        text="Введите новую ссылку фотографии.")
-            elif rows[3] == 2:  # Если тип чата - текст
+            elif rows[4] == 2:  # Если тип чата - текст
                 # Отправляем сообщение с текущим текстом и просьбой ввести новый текст
                 await bot.send_message(chat_id=message.from_user.id,
-                                       text=f"Текущий текст для группы {rows[1]}")
+                                       text=f"Текущий текст для группы {rows[2]}")
                 await bot.send_message(chat_id=message.from_user.id, 
-                                       text=rows[4])
+                                       text=rows[5])
                 await bot.send_message(chat_id=message.from_user.id,
                                        text="Введите новый текст.")
             
@@ -913,13 +892,14 @@ async def settings_confirm_data(message: types.Message, state: FSMContext):
             # В случае ошибки отправки фотографии выводим сообщение о некорректной ссылке и завершаем функцию
             await bot.send_message(chat_id=message.from_user.id,
                            text="Некорректная ссылка на фотографию. Пожалуйста, проверьте ссылку.")
+            
             await bot.send_message(chat_id=message.from_user.id,
                            text="Вы вернулись в панель администратора.",
                            reply_markup=kb)
             await MainState.admin_setting.set()
             return
         # Если фотография была успешно отправлена, обновляем информацию о чате в базе данных
-        cursor.execute("UPDATE main SET text = ?, url = ? WHERE title = ? AND status = ?", (message.text, url[0], name_public, 2))
+        cursor.execute("UPDATE main SET url = ? WHERE title = ? AND status = ?", (url[0], name_public, 1))
     else:
         # В случае отсутствия ссылки в сообщении, просто обновляем текст
         cursor.execute("UPDATE main SET text = ? WHERE title = ? AND status = ?", (message.text, name_public, 2))
@@ -945,26 +925,10 @@ async def settings_interval(message: types.Message):
     
     :param message: Сообщение с запросом на изменение периодичности отправки сообщений
     """
-    # Асинхронно получаем список чатов из базы данных
-    cursor.execute("SELECT * FROM number_of_messages")
-    rows = cursor.fetchall()
-    
-    if rows:  # Проверяем, не пуст ли список чатов
-        # Создаем клавиатуру для выбора чата
-        kb = ReplyKeyboardMarkup()
-        for row in rows:
-            kb.add(KeyboardButton(f'{row[1]} ; количество: {row[2]}'))
-        
-        # Отправляем сообщение с просьбой выбрать чат и клавиатурой
-        await bot.send_message(chat_id=message.from_user.id,
-                               text="Выберите чат:",
-                               reply_markup=kb)
-        
-        # Устанавливаем состояние 'targetChat' для ожидания выбора чата для изменения периодичности отправки сообщений
+    check = await InputNameGroup(message)
+    if check:
         await MessageIntervalModificationState.targetChat.set()
-    else:
-        await bot.send_message(chat_id=message.from_user.id,
-                               text="Нет доступных чатов для изменения периодичности отправки сообщений.")
+    
 
 
 
@@ -983,8 +947,8 @@ async def settings_new_interval(message: types.Message):
     row = cursor.fetchall()
     
     for rows in row:
-        if message.text.split(';')[0].strip() == f"{rows[1]}":  # Если выбранный чат соответствует одному из чатов в базе данных
-            name_public = rows[1]  # Сохраняем название выбранного чата
+        if message.text.split(';')[0].strip() == f"{rows[2]}":  # Если выбранный чат соответствует одному из чатов в базе данных
+            name_public = rows[2]  # Сохраняем название выбранного чата
             
             # Отправляем сообщение с просьбой ввести новое количество сообщений
             await bot.send_message(chat_id=message.from_user.id,
@@ -1042,7 +1006,8 @@ async def count_messages(message: types.Message):
     
     # Проверяем, достигнуто ли num_of_message сообщений в чате
     if num_of_message is not None and messages_history[chat_id] >= num_of_message:
-        await send_notification(chat_id, None, message)  # Отправляем оповещение
+        await delete_previous_message(chat_id)
+        await send_notification(chat_id, message)  # Отправляем оповещение
         messages_history[chat_id] = 0  # Сбрасываем счетчик сообщений для данного чата
 
 

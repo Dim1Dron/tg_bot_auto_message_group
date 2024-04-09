@@ -1,6 +1,5 @@
 #-Токен телеграм бота-
-# TOKEN_API = '7030376818:AAHDlBpTF63riJb7TveJQvgg8FOfRX4dAsM'
-TOKEN_API = '7161634867:AAHWMoUUfUT0g8aNEzS6ycvMDdACdUiMQ5A'
+TOKEN_API = '7183909269:AAEazXr_hJi6Yr-64qHZrfg4ATEsiyFMYY0'
 #-Количество сообщений по умолчанию-
 NUMBER_MESSAGE = 100
 
